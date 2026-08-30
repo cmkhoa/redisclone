@@ -110,6 +110,11 @@ type Store struct {
 
 	data map[string]*entry
 
+	// readShards mirror data by key. Single-key reads use these independently
+	// locked maps; the original map remains the coordination point while the
+	// later stage-six slices move multi-key mutation and housekeeping across.
+	readShards [shardCount]readShard
+
 	// expiring indexes the volatile keys — exactly the keys whose entry has a
 	// non-zero expiresAt.
 	//
@@ -137,6 +142,11 @@ type Store struct {
 	stats     Stats
 }
 
+type readShard struct {
+	mu   sync.RWMutex
+	data map[string]*entry
+}
+
 // Stats are monotonically increasing counters exposed by INFO.
 type Stats struct {
 	KeyspaceHits   atomic.Uint64
@@ -146,11 +156,17 @@ type Stats struct {
 }
 
 func New() *Store {
-	return &Store{
+	s := &Store{
 		data:     make(map[string]*entry),
 		expiring: make(map[string]struct{}),
 	}
+	for i := range s.readShards {
+		s.readShards[i].data = make(map[string]*entry)
+	}
+	return s
 }
+
+func (s *Store) readShard(key string) *readShard { return &s.readShards[shardIndex(key)] }
 
 // SetJournal attaches a journal. Call it before serving clients: it is not
 // synchronised, because a journal appearing mid-flight would leave the log
@@ -194,10 +210,11 @@ func unixMillis(t time.Time) []byte {
 func (s *Store) Get(key string) ([]byte, bool) {
 	now := time.Now()
 
-	s.mu.RLock()
-	e, ok := s.data[key]
+	shard := s.readShard(key)
+	shard.mu.RLock()
+	e, ok := shard.data[key]
 	expired := ok && e.expired(now)
-	s.mu.RUnlock()
+	shard.mu.RUnlock()
 
 	switch {
 	case !ok:
@@ -284,6 +301,10 @@ func (s *Store) setLocked(key string, val []byte, expiresAt time.Time) {
 	e := &entry{val: val, expiresAt: expiresAt}
 	e.atime.Store(s.clock.Load())
 	s.data[key] = e
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	shard.data[key] = e
+	shard.mu.Unlock()
 	s.used += entrySize(key, val)
 	if expiresAt.IsZero() {
 		delete(s.expiring, key)
@@ -334,6 +355,10 @@ func (s *Store) setLockedNoJournal(key string, val []byte, expiresAt time.Time) 
 	e := &entry{val: val, expiresAt: expiresAt}
 	e.atime.Store(s.clock.Load())
 	s.data[key] = e
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	shard.data[key] = e
+	shard.mu.Unlock()
 	s.used += entrySize(key, val)
 	if expiresAt.IsZero() {
 		delete(s.expiring, key)
@@ -439,7 +464,10 @@ func (s *Store) ExpireAt(key string, at time.Time) bool {
 		s.propagate(cmdDEL, []byte(key))
 		return true
 	}
+	shard := s.readShard(key)
+	shard.mu.Lock()
 	e.expiresAt = at
+	shard.mu.Unlock()
 	s.expiring[key] = struct{}{}
 	s.propagate(cmdPEXPIREAT, []byte(key), unixMillis(at))
 	return true
@@ -450,21 +478,26 @@ func (s *Store) ExpireAt(key string, at time.Time) bool {
 func (s *Store) TTL(key string) (time.Duration, TTLState) {
 	now := time.Now()
 
-	s.mu.RLock()
-	e, ok := s.data[key]
-	s.mu.RUnlock()
+	shard := s.readShard(key)
+	shard.mu.RLock()
+	e, ok := shard.data[key]
+	expiresAt := time.Time{}
+	if ok {
+		expiresAt = e.expiresAt
+	}
+	shard.mu.RUnlock()
 
 	switch {
-	case !ok, e.expired(now):
+	case !ok, (!expiresAt.IsZero() && !now.Before(expiresAt)):
 		// Deliberately does not collect the expired key: TTL is a read, and
 		// taking the write lock on a read path is a cost every reader pays for
 		// a cleanup the sampler will do anyway. Get collects because it has to
 		// re-check under the write lock regardless; TTL has no such need.
 		return 0, KeyMissing
-	case e.expiresAt.IsZero():
+	case expiresAt.IsZero():
 		return 0, KeyPersistent
 	default:
-		return e.expiresAt.Sub(now), KeyVolatile
+		return expiresAt.Sub(now), KeyVolatile
 	}
 }
 
@@ -510,13 +543,16 @@ func (s *Store) Exists(keys ...string) int {
 	now := time.Now()
 	n := 0
 
-	s.mu.RLock()
 	for _, k := range keys {
-		if e, ok := s.data[k]; ok && !e.expired(now) {
+		shard := s.readShard(k)
+		shard.mu.RLock()
+		e, ok := shard.data[k]
+		expired := ok && e.expired(now)
+		shard.mu.RUnlock()
+		if ok && !expired {
 			n++
 		}
 	}
-	s.mu.RUnlock()
 	return n
 }
 
@@ -591,5 +627,9 @@ func (s *Store) deleteLocked(key string) {
 		s.used -= entrySize(key, e.val)
 	}
 	delete(s.data, key)
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	delete(shard.data, key)
+	shard.mu.Unlock()
 	delete(s.expiring, key)
 }

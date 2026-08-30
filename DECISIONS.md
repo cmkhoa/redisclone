@@ -732,3 +732,16 @@ without a measurable profile target.
 parsing below 2%; lock contention and network/syscall scheduling dominated.
 Changing ownership rules or adding pools for that amount of CPU would make the
 code harder to reason about while failing to move the measured bottleneck.
+
+### Stage-six checkpoint: shard reads before migrating writes
+
+**Chosen:** route single-key reads through 32 independently locked shard maps
+as the first sharding slice; keep the original map as the mutation,
+expiration, eviction, and AOF coordination point temporarily.
+
+**Why:** this establishes stable routing and validates the lock layout without
+splitting canonical mutation state. On the M1 Pro, parallel GET improved from
+224 ns/op to 84 ns/op at eight CPUs, while one-core GET rose from 55 ns/op to
+68 ns/op. The trade is deliberate: this checkpoint is safe and measurable,
+but it is not the final write-path architecture. Canonical shard ownership and
+deterministic multi-shard mutation are the next indivisible migration.

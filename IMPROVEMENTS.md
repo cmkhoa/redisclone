@@ -77,7 +77,7 @@ of cumulative CPU and RESP bulk parsing below 2%. The dominant costs remained
 the keyspace lock and network/syscall scheduling, so no parser or allocation
 rewrite was accepted. Stage 6 is the evidence-backed performance next step.
 
-## 6. Shard the keyspace
+## 6. Shard the keyspace — in progress
 
 **Scope:** major architecture change; do this only after the earlier behavior
 is well covered.
@@ -94,6 +94,12 @@ is well covered.
 **Done when:** race and e2e coverage proves the old semantics, M5 shows a
 meaningful write-throughput gain, and the new complexity is documented in
 `DECISIONS.md`.
+
+**Current slice:** single-key reads are routed through 32 independently locked
+shard maps while the original map still coordinates mutation and housekeeping.
+On the M1 Pro, parallel GET improved from the prior 224 ns/op to 84 ns/op at
+eight CPUs (with a one-CPU cost of 55 ns/op to 68 ns/op). The next slice moves
+the canonical write path and multi-key lock ordering onto the shard maps.
 
 ## 7. Production-facing features
 

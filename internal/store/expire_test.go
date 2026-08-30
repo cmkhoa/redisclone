@@ -19,6 +19,10 @@ func plantExpired(s *Store, key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.data[key] = &entry{val: []byte("stale"), expiresAt: time.Now().Add(-time.Second)}
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	shard.data[key] = s.data[key]
+	shard.mu.Unlock()
 	s.expiring[key] = struct{}{}
 	s.used += entrySize(key, []byte("stale"))
 }
