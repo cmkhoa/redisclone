@@ -110,9 +110,9 @@ type Store struct {
 
 	data map[string]*entry
 
-	// readShards mirror data by key. Single-key reads use these independently
-	// locked maps; the original map remains the coordination point while the
-	// later stage-six slices move multi-key mutation and housekeeping across.
+	// readShards are becoming the canonical keyspace. Each owns the data,
+	// volatile-key index, and memory subtotal for its key range. The legacy
+	// maps below remain only while write, expiry, and eviction paths migrate.
 	readShards [shardCount]readShard
 
 	// expiring indexes the volatile keys — exactly the keys whose entry has a
@@ -143,8 +143,10 @@ type Store struct {
 }
 
 type readShard struct {
-	mu   sync.RWMutex
-	data map[string]*entry
+	mu       sync.RWMutex
+	data     map[string]*entry
+	expiring map[string]struct{}
+	used     int64
 }
 
 // Stats are monotonically increasing counters exposed by INFO.
@@ -162,6 +164,7 @@ func New() *Store {
 	}
 	for i := range s.readShards {
 		s.readShards[i].data = make(map[string]*entry)
+		s.readShards[i].expiring = make(map[string]struct{})
 	}
 	return s
 }
@@ -303,7 +306,16 @@ func (s *Store) setLocked(key string, val []byte, expiresAt time.Time) {
 	s.data[key] = e
 	shard := s.readShard(key)
 	shard.mu.Lock()
+	if old, ok := shard.data[key]; ok {
+		shard.used -= entrySize(key, old.val)
+	}
 	shard.data[key] = e
+	shard.used += entrySize(key, val)
+	if expiresAt.IsZero() {
+		delete(shard.expiring, key)
+	} else {
+		shard.expiring[key] = struct{}{}
+	}
 	shard.mu.Unlock()
 	s.used += entrySize(key, val)
 	if expiresAt.IsZero() {
@@ -357,7 +369,16 @@ func (s *Store) setLockedNoJournal(key string, val []byte, expiresAt time.Time) 
 	s.data[key] = e
 	shard := s.readShard(key)
 	shard.mu.Lock()
+	if old, ok := shard.data[key]; ok {
+		shard.used -= entrySize(key, old.val)
+	}
 	shard.data[key] = e
+	shard.used += entrySize(key, val)
+	if expiresAt.IsZero() {
+		delete(shard.expiring, key)
+	} else {
+		shard.expiring[key] = struct{}{}
+	}
 	shard.mu.Unlock()
 	s.used += entrySize(key, val)
 	if expiresAt.IsZero() {
@@ -467,6 +488,7 @@ func (s *Store) ExpireAt(key string, at time.Time) bool {
 	shard := s.readShard(key)
 	shard.mu.Lock()
 	e.expiresAt = at
+	shard.expiring[key] = struct{}{}
 	shard.mu.Unlock()
 	s.expiring[key] = struct{}{}
 	s.propagate(cmdPEXPIREAT, []byte(key), unixMillis(at))
@@ -563,9 +585,13 @@ func (s *Store) Exists(keys ...string) int {
 // can see. It is the right number for tests and for M4's memory accounting,
 // both of which care about what is actually held.
 func (s *Store) Len() int {
-	s.mu.RLock()
-	n := len(s.data)
-	s.mu.RUnlock()
+	n := 0
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		n += len(shard.data)
+		shard.mu.RUnlock()
+	}
 	return n
 }
 
@@ -573,14 +599,17 @@ func (s *Store) Len() int {
 // yet been sampled are deliberately excluded.
 func (s *Store) DBSize() int {
 	now := time.Now()
-	s.mu.RLock()
 	n := 0
-	for _, e := range s.data {
-		if !e.expired(now) {
-			n++
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		for _, e := range shard.data {
+			if !e.expired(now) {
+				n++
+			}
 		}
+		shard.mu.RUnlock()
 	}
-	s.mu.RUnlock()
 	return n
 }
 
@@ -592,19 +621,22 @@ func (s *Store) Stats() *Stats { return &s.stats }
 // released while the AOF writer works in the background.
 func (s *Store) AOFSnapshot() [][][]byte {
 	now := time.Now()
-	s.mu.RLock()
-	out := make([][][]byte, 0, len(s.data))
-	for key, e := range s.data {
-		if e.expired(now) {
-			continue
+	out := make([][][]byte, 0, s.Len())
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		for key, e := range shard.data {
+			if e.expired(now) {
+				continue
+			}
+			record := [][]byte{cmdSET, []byte(key), e.val}
+			if !e.expiresAt.IsZero() {
+				record = append(record, cmdPXAT, unixMillis(e.expiresAt))
+			}
+			out = append(out, record)
 		}
-		record := [][]byte{cmdSET, []byte(key), e.val}
-		if !e.expiresAt.IsZero() {
-			record = append(record, cmdPXAT, unixMillis(e.expiresAt))
-		}
-		out = append(out, record)
+		shard.mu.RUnlock()
 	}
-	s.mu.RUnlock()
 	return out
 }
 
@@ -629,7 +661,11 @@ func (s *Store) deleteLocked(key string) {
 	delete(s.data, key)
 	shard := s.readShard(key)
 	shard.mu.Lock()
+	if e, ok := shard.data[key]; ok {
+		shard.used -= entrySize(key, e.val)
+	}
 	delete(shard.data, key)
+	delete(shard.expiring, key)
 	shard.mu.Unlock()
 	delete(s.expiring, key)
 }

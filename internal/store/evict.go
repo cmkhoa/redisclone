@@ -78,9 +78,14 @@ func (s *Store) SetMemoryLimit(maxMemory int64, policy EvictionPolicy) {
 
 // Used returns the store's estimate of the memory the keyspace occupies.
 func (s *Store) Used() int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.used
+	var used int64
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		used += shard.used
+		shard.mu.RUnlock()
+	}
+	return used
 }
 
 // MaxMemory returns the configured budget, 0 if unlimited.
