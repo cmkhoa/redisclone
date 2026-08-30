@@ -57,6 +57,9 @@ func TestReplayRebuildsTheKeyspace(t *testing.T) {
 		cmd("EXPIRE", "given-a-ttl", "2000"),
 		cmd("SET", "ttl-then-cleared", "v", "EX", "50"),
 		cmd("SET", "ttl-then-cleared", "v2"),
+		cmd("MSET", "batch-a", "1", "batch-b", "two"),
+		cmd("INCR", "batch-a"),
+		cmd("APPEND", "batch-b", "!"),
 	}, ""))
 
 	// Let the short-lived key actually expire before the restart.
@@ -70,6 +73,7 @@ func TestReplayRebuildsTheKeyspace(t *testing.T) {
 		cmd("GET", "expired-already"), cmd("TTL", "expired-already"),
 		cmd("TTL", "plain"), cmd("TTL", "volatile"), cmd("TTL", "given-a-ttl"),
 		cmd("GET", "ttl-then-cleared"), cmd("TTL", "ttl-then-cleared"),
+		cmd("MGET", "batch-a", "batch-b"), cmd("STRLEN", "batch-b"),
 	}, "")
 
 	want := run(t, original, questions)
@@ -231,8 +235,13 @@ func TestExpireAtCommands(t *testing.T) {
 		cmd("PEXPIREAT", "missing", itoa(future.UnixMilli()))
 
 	want := "+OK\r\n:1\r\n:3600\r\n" + "+OK\r\n:1\r\n:3600\r\n" + "+OK\r\n:1\r\n$-1\r\n" + ":0\r\n"
-	if got := run(t, s, script); got != want {
-		t.Errorf("got %q, want %q", got, want)
+	got := run(t, s, script)
+	// The two commands are issued on either side of a wall-clock second
+	// boundary often enough to make an exact 3600-second assertion flaky.
+	// Both answers still prove the key has roughly an hour left.
+	justUnder := "+OK\r\n:1\r\n:3600\r\n" + "+OK\r\n:1\r\n:3599\r\n" + "+OK\r\n:1\r\n$-1\r\n" + ":0\r\n"
+	if got != want && got != justUnder {
+		t.Errorf("got %q, want about an hour remaining", got)
 	}
 }
 

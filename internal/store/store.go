@@ -31,6 +31,7 @@
 package store
 
 import (
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -171,6 +172,7 @@ func (s *Store) propagate(args ...[]byte) {
 // Command names as they appear in the journal.
 var (
 	cmdSET       = []byte("SET")
+	cmdMSET      = []byte("MSET")
 	cmdDEL       = []byte("DEL")
 	cmdPXAT      = []byte("PXAT")
 	cmdPEXPIREAT = []byte("PEXPIREAT")
@@ -265,10 +267,17 @@ func (s *Store) SetWithDeadline(key string, val []byte, at time.Time) {
 }
 
 func (s *Store) set(key string, val []byte, expiresAt time.Time) {
+	s.mu.Lock()
+	s.setLocked(key, val, expiresAt)
+	s.mu.Unlock()
+}
+
+// setLocked replaces key while preserving the accounting/index invariants.
+// The caller holds s.mu.
+func (s *Store) setLocked(key string, val []byte, expiresAt time.Time) {
 	if val == nil {
 		val = []byte{}
 	}
-	s.mu.Lock()
 	if old, ok := s.data[key]; ok {
 		s.used -= entrySize(key, old.val)
 	}
@@ -278,15 +287,118 @@ func (s *Store) set(key string, val []byte, expiresAt time.Time) {
 	s.used += entrySize(key, val)
 	if expiresAt.IsZero() {
 		delete(s.expiring, key)
-		s.propagate(cmdSET, []byte(key), val)
 	} else {
 		s.expiring[key] = struct{}{}
-		// One record, not a SET followed by a PEXPIREAT: a torn tail between
-		// the two would replay as a key that never expires, which is the one
-		// failure mode a cache must not have.
-		s.propagate(cmdSET, []byte(key), val, cmdPXAT, unixMillis(expiresAt))
 	}
+	s.propagateSetLocked(key, val, expiresAt)
+}
+
+// propagateSetLocked records a full value replacement. The caller holds s.mu.
+func (s *Store) propagateSetLocked(key string, val []byte, expiresAt time.Time) {
+	if expiresAt.IsZero() {
+		s.propagate(cmdSET, []byte(key), val)
+		return
+	}
+	// One record, not SET plus PEXPIREAT: a torn tail must not create a value
+	// that was supposed to expire forever.
+	s.propagate(cmdSET, []byte(key), val, cmdPXAT, unixMillis(expiresAt))
+}
+
+// Pair is one key/value assignment for MSET.
+type Pair struct {
+	Key   string
+	Value []byte
+}
+
+// MSet atomically applies all assignments. A later duplicate key wins, like
+// Redis. Plain assignments clear any previous TTL.
+func (s *Store) MSet(pairs []Pair) {
+	s.mu.Lock()
+	args := make([][]byte, 1, 1+2*len(pairs))
+	args[0] = cmdMSET
+	for _, p := range pairs {
+		s.setLockedNoJournal(p.Key, p.Value, time.Time{})
+		args = append(args, []byte(p.Key), p.Value)
+	}
+	s.propagate(args...)
 	s.mu.Unlock()
+}
+
+func (s *Store) setLockedNoJournal(key string, val []byte, expiresAt time.Time) {
+	if val == nil {
+		val = []byte{}
+	}
+	if old, ok := s.data[key]; ok {
+		s.used -= entrySize(key, old.val)
+	}
+	e := &entry{val: val, expiresAt: expiresAt}
+	e.atime.Store(s.clock.Load())
+	s.data[key] = e
+	s.used += entrySize(key, val)
+	if expiresAt.IsZero() {
+		delete(s.expiring, key)
+	} else {
+		s.expiring[key] = struct{}{}
+	}
+}
+
+var ErrNotInteger = errors.New("value is not an integer or out of range")
+
+// Increment adds delta to key's integer value. It uses copy-on-write and
+// preserves a live key's TTL.
+func (s *Store) Increment(key string, delta int64) (int64, error) {
+	now := time.Now()
+	s.mu.Lock()
+	e, ok := s.data[key]
+	if ok && e.expired(now) {
+		s.deleteLocked(key)
+		ok = false
+	}
+	var n int64
+	if ok {
+		var err error
+		n, err = strconv.ParseInt(string(e.val), 10, 64)
+		if err != nil {
+			s.mu.Unlock()
+			return 0, ErrNotInteger
+		}
+	}
+	if (delta > 0 && n > int64(^uint64(0)>>1)-delta) || (delta < 0 && n < -int64(^uint64(0)>>1)-1-delta) {
+		s.mu.Unlock()
+		return 0, ErrNotInteger
+	}
+	n += delta
+	var expiresAt time.Time
+	if ok {
+		expiresAt = e.expiresAt
+	}
+	val := strconv.AppendInt(nil, n, 10)
+	s.setLocked(key, val, expiresAt)
+	s.mu.Unlock()
+	return n, nil
+}
+
+// Append adds suffix to key and returns the resulting length. It never mutates
+// the existing value, because GET may have handed that slice to another client.
+func (s *Store) Append(key string, suffix []byte) int {
+	now := time.Now()
+	s.mu.Lock()
+	e, ok := s.data[key]
+	if ok && e.expired(now) {
+		s.deleteLocked(key)
+		ok = false
+	}
+	var old []byte
+	var expiresAt time.Time
+	if ok {
+		old, expiresAt = e.val, e.expiresAt
+	}
+	val := make([]byte, len(old)+len(suffix))
+	copy(val, old)
+	copy(val[len(old):], suffix)
+	s.setLocked(key, val, expiresAt)
+	s.mu.Unlock()
+	return len(val)
 }
 
 // Expire gives key a deadline ttl from now, replacing any existing one, and

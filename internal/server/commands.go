@@ -43,7 +43,13 @@ var commands = map[string]command{
 	"PING":      {0, 1, false, (*Server).ping},
 	"ECHO":      {1, 1, false, (*Server).echo},
 	"SET":       {2, 4, true, (*Server).set},
+	"MSET":      {2, -1, true, (*Server).mset},
 	"GET":       {1, 1, false, (*Server).get},
+	"MGET":      {1, -1, false, (*Server).mget},
+	"INCR":      {1, 1, true, (*Server).incr},
+	"DECR":      {1, 1, true, (*Server).decr},
+	"APPEND":    {2, 2, true, (*Server).append},
+	"STRLEN":    {1, 1, false, (*Server).strlen},
 	"DEL":       {1, -1, true, (*Server).del},
 	"EXISTS":    {1, -1, false, (*Server).exists},
 	"EXPIRE":    {2, 2, true, (*Server).expire},
@@ -197,6 +203,60 @@ func (s *Server) get(w *resp.Writer, args [][]byte) error {
 		return w.WriteNullBulkString()
 	}
 	return w.WriteBulkString(v)
+}
+
+func (s *Server) mget(w *resp.Writer, args [][]byte) error {
+	if err := w.WriteArrayHeader(len(args)); err != nil {
+		return err
+	}
+	for _, key := range args {
+		v, ok := s.store.Get(string(key))
+		if !ok {
+			if err := w.WriteNullBulkString(); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := w.WriteBulkString(v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) mset(w *resp.Writer, args [][]byte) error {
+	if len(args)%2 != 0 {
+		return wrongArity(w, "MSET")
+	}
+	pairs := make([]store.Pair, 0, len(args)/2)
+	for i := 0; i < len(args); i += 2 {
+		pairs = append(pairs, store.Pair{Key: string(args[i]), Value: args[i+1]})
+	}
+	s.store.MSet(pairs)
+	return w.WriteSimpleString("OK")
+}
+
+func (s *Server) incr(w *resp.Writer, args [][]byte) error { return s.increment(w, args[0], 1) }
+func (s *Server) decr(w *resp.Writer, args [][]byte) error { return s.increment(w, args[0], -1) }
+
+func (s *Server) increment(w *resp.Writer, key []byte, delta int64) error {
+	n, err := s.store.Increment(string(key), delta)
+	if err != nil {
+		return w.WriteError("ERR value is not an integer or out of range")
+	}
+	return w.WriteInteger(n)
+}
+
+func (s *Server) append(w *resp.Writer, args [][]byte) error {
+	return w.WriteInteger(int64(s.store.Append(string(args[0]), args[1])))
+}
+
+func (s *Server) strlen(w *resp.Writer, args [][]byte) error {
+	v, ok := s.store.Get(string(args[0]))
+	if !ok {
+		return w.WriteInteger(0)
+	}
+	return w.WriteInteger(int64(len(v)))
 }
 
 // del: DEL key [key ...] -> number of keys that existed.

@@ -7,7 +7,8 @@ defensible design choices.
 ## Features
 
 - RESP2 over TCP; works with `redis-cli`
-- `PING`, `ECHO`, `GET`, `SET`, `DEL`, `EXISTS`
+- `PING`, `ECHO`, `GET`, `SET`, `MGET`, `MSET`, `DEL`, `EXISTS`
+- String operations: `INCR`, `DECR`, `APPEND`, `STRLEN`
 - Key expiry: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`
 - Append-only-file durability with `always`, `everysec`, and `no` fsync modes
 - Memory limits with `noeviction`, `allkeys-lru`, `allkeys-random`, and
@@ -38,7 +39,13 @@ local profiling.
 make test
 make e2e
 go test -race ./internal/... ./cmd/...
+make bench-store
 ```
+
+With a running server and `redis-benchmark` installed, run the M5 wire
+workload with `make bench-wire` (override `BENCH_ADDR`, `BENCH_N`, `BENCH_C`,
+or `BENCH_P` as needed). Start with `-pprof-addr 127.0.0.1:6060`, then run
+`make profile-top` for a CPU summary.
 
 See [PLANNING.md](PLANNING.md) for milestone details and
 [DECISIONS.md](DECISIONS.md) for the design rationale.

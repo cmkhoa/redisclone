@@ -4,7 +4,7 @@ Work from low-risk, self-contained changes toward changes that alter the
 keyspace architecture. Each stage should finish with `make test`, `make e2e`,
 and `go test -race ./internal/... ./cmd/...` green.
 
-## 1. Make measurement repeatable
+## 1. Make measurement repeatable — complete
 
 **Scope:** tooling only; no server behavior changes.
 
@@ -16,7 +16,7 @@ and `go test -race ./internal/... ./cmd/...` green.
 **Done when:** a developer can repeat the Redis comparison and CPU profile
 without reconstructing shell commands from project history.
 
-## 2. Add small, high-value commands
+## 2. Add small, high-value commands — complete
 
 **Scope:** extend the command table and store API without changing storage
 layout.
