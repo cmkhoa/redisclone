@@ -60,12 +60,11 @@ const SyncInterval = time.Second
 
 // Log is an open append-only file.
 //
-// Safe for concurrent use. Append is called with the keyspace lock held (that
-// is what keeps the log's order identical to the order mutations actually
-// happened in), so it does the cheapest possible thing: encode into a buffer.
-// Flushing and fsyncing happen in Sync, which is deliberately never called with
-// the keyspace lock held — an fsync can take milliseconds, and holding the
-// keyspace for that long would stall every client on the server.
+// Safe for concurrent use. Store calls Append with its durable-commit gate held
+// (that is what keeps the log's order identical to mutation order), so it does
+// the cheapest possible thing: encode into a buffer. Flushing and fsyncing
+// happen in Sync, which is deliberately never called with that gate held — an
+// fsync can take milliseconds, and holding it would stall every writer.
 type Log struct {
 	mu     sync.Mutex
 	f      *os.File
@@ -104,8 +103,8 @@ func (l *Log) Policy() Policy { return l.policy }
 
 // Append encodes one command into the log's buffer.
 //
-// Buffer only: no write(2), no fsync. The caller holds the keyspace lock, and
-// the whole point of this being cheap is that the lock is released again
+// Buffer only: no write(2), no fsync. The caller holds the durable-commit gate,
+// and the whole point of this being cheap is that the gate is released again
 // immediately.
 func (l *Log) Append(args ...[]byte) error {
 	l.mu.Lock()
@@ -241,7 +240,7 @@ func (l *Log) abortRewrite() {
 // Sync flushes the buffer to the kernel and, unless the policy says otherwise,
 // asks the kernel to put it on the disk.
 //
-// Must not be called with the keyspace lock held.
+// Must not be called with Store's durable-commit gate held.
 func (l *Log) Sync() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()

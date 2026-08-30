@@ -14,6 +14,8 @@ defensible design choices.
 - `BGREWRITEAOF` compacts the append-only file without stopping writes
 - Memory limits with `noeviction`, `allkeys-lru`, `allkeys-random`, and
   `volatile-lru` policies
+- 32-shard canonical keyspace with ordered multi-key locking and concurrent
+  single-key operations
 - `INFO` and `DBSIZE`
 - `CONFIG GET` for supported startup settings; graceful SIGINT/SIGTERM shutdown
 

@@ -16,39 +16,33 @@ import (
 // plantExpired inserts a key that expired a second ago, bypassing the public
 // API — exactly the state the sampler and the lazy path are supposed to find.
 func plantExpired(s *Store, key string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.data[key] = &entry{val: []byte("stale"), expiresAt: time.Now().Add(-time.Second)}
 	shard := s.readShard(key)
 	shard.mu.Lock()
-	shard.data[key] = s.data[key]
+	shard.data[key] = &entry{val: []byte("stale"), expiresAt: time.Now().Add(-time.Second)}
 	shard.expiring[key] = struct{}{}
 	shard.used += entrySize(key, []byte("stale"))
 	shard.mu.Unlock()
-	s.expiring[key] = struct{}{}
-	s.used += entrySize(key, []byte("stale"))
 }
 
 // checkIndex asserts the invariant that ties the two maps together: a key is in
 // `expiring` if and only if its entry has a deadline.
 func checkIndex(t *testing.T, s *Store) {
 	t.Helper()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	for k, e := range s.data {
-		_, indexed := s.expiring[k]
-		if e.expiresAt.IsZero() && indexed {
-			t.Errorf("key %q has no deadline but is in the expiring index", k)
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		for k, e := range shard.data {
+			_, indexed := shard.expiring[k]
+			if indexed != !e.expiresAt.IsZero() {
+				t.Errorf("shard %d index mismatch for %q", i, k)
+			}
 		}
-		if !e.expiresAt.IsZero() && !indexed {
-			t.Errorf("key %q has a deadline but is missing from the expiring index", k)
+		for k := range shard.expiring {
+			if _, ok := shard.data[k]; !ok {
+				t.Errorf("shard %d index contains absent key %q", i, k)
+			}
 		}
-	}
-	for k := range s.expiring {
-		if _, ok := s.data[k]; !ok {
-			t.Errorf("key %q is in the expiring index but not in the keyspace", k)
-		}
+		shard.mu.RUnlock()
 	}
 }
 
@@ -244,7 +238,7 @@ func TestActiveExpireCycleCollectsExpiredKeys(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		_, expired := s.activeExpireCycle()
 		total += expired
-		if len(s.expiring) == 0 {
+		if expiringLen(s) == 0 {
 			break
 		}
 	}
@@ -261,6 +255,17 @@ func TestActiveExpireCycleCollectsExpiredKeys(t *testing.T) {
 		}
 	}
 	checkIndex(t, s)
+}
+
+func expiringLen(s *Store) int {
+	n := 0
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		n += len(shard.expiring)
+		shard.mu.RUnlock()
+	}
+	return n
 }
 
 // A cycle over a keyspace with nothing expired must stop after one round: the

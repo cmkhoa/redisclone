@@ -114,18 +114,18 @@ func (s *Store) EnforceMemoryLimit() (evicted int, ok bool) {
 		return 0, true
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockDurableMutation()
+	defer s.unlockDurableMutation()
 
-	if s.used <= s.maxMemory {
+	if s.Used() <= s.maxMemory {
 		return 0, true
 	}
 	if s.Policy() == PolicyNoEviction {
 		return 0, false
 	}
 
-	for s.used > s.maxMemory {
-		key, found := s.pickVictimLocked()
+	for s.Used() > s.maxMemory {
+		key, found := s.pickVictim()
 		if !found {
 			// Nothing left that this policy is allowed to evict.
 			return evicted, false
@@ -145,22 +145,14 @@ func (s *Store) EnforceMemoryLimit() (evicted int, ok bool) {
 	return evicted, true
 }
 
-// pickVictimLocked chooses a key to evict under the configured policy.
+// pickVictim chooses a key to evict under the configured policy.
 //
 // Approximated LRU: sample a handful of keys and evict the oldest of them,
 // rather than tracking exact recency. See DECISIONS.md — the short version is
 // that exact LRU needs an intrusive linked list whose nodes must be moved on
 // every read, which turns every GET into a write-locked operation.
-func (s *Store) pickVictimLocked() (string, bool) {
-	pool := s.data
+func (s *Store) pickVictim() (string, bool) {
 	volatile := s.Policy() == PolicyVolatileLRU
-	if volatile {
-		if len(s.expiring) == 0 {
-			return "", false
-		}
-	} else if len(s.data) == 0 {
-		return "", false
-	}
 
 	var (
 		best      string
@@ -172,9 +164,10 @@ func (s *Store) pickVictimLocked() (string, bool) {
 	// Ranging a map starts at a random bucket, so taking the first few keys is
 	// a cheap random sample. The same trick the expiry sampler uses.
 	sample := func(key string) bool {
-		e, ok := s.data[key]
+		shard := s.readShard(key)
+		e, ok := shard.data[key]
 		if !ok {
-			return true // index drift; the expiry sampler repairs it
+			return true
 		}
 		scanned++
 		if !found || e.atime.Load() < bestAtime {
@@ -183,22 +176,34 @@ func (s *Store) pickVictimLocked() (string, bool) {
 		return scanned < evictSampleSize
 	}
 
-	if volatile {
-		for key := range s.expiring {
-			if !sample(key) {
-				break
+	for i := range s.readShards {
+		shard := &s.readShards[i]
+		shard.mu.RLock()
+		pool := shard.data
+		if volatile {
+			pool = nil
+		}
+		if volatile {
+			for key := range shard.expiring {
+				if !sample(key) {
+					break
+				}
+			}
+		} else if s.Policy() == PolicyAllKeysRandom {
+			for key := range pool {
+				shard.mu.RUnlock()
+				return key, true
+			}
+		} else {
+			for key := range pool {
+				if !sample(key) {
+					break
+				}
 			}
 		}
-	} else if s.Policy() == PolicyAllKeysRandom {
-		// One key, no comparison: this policy is the control group.
-		for key := range pool {
-			return key, true
-		}
-	} else {
-		for key := range pool {
-			if !sample(key) {
-				break
-			}
+		shard.mu.RUnlock()
+		if scanned >= evictSampleSize {
+			break
 		}
 	}
 	return best, found

@@ -77,29 +77,24 @@ of cumulative CPU and RESP bulk parsing below 2%. The dominant costs remained
 the keyspace lock and network/syscall scheduling, so no parser or allocation
 rewrite was accepted. Stage 6 is the evidence-backed performance next step.
 
-## 6. Shard the keyspace — in progress
+## 6. Shard the keyspace — complete (2026-08-29)
 
-**Scope:** major architecture change; do this only after the earlier behavior
-is well covered.
+The canonical keyspace is 32 FNV-1a-routed shards. Each shard owns its map,
+expiry index, memory subtotal, and RWMutex; the former global maps and
+keyspace lock have been removed.
 
-- Split the keyspace into 32–64 shards, each with its own lock, data map,
-  expiry index, LRU metadata, and memory subtotal.
-- Route single-key commands to one shard.
-- For multi-key operations, sort shard IDs before acquiring locks. This
-  prevents deadlock and preserves the current atomic `DEL` behavior.
-- Rework active expiration, global memory accounting, and sampled eviction so
-  they select candidates across shards.
-- Retain AOF mutation ordering despite concurrent shard writes.
+- Single-key mutations lock only their owning shard. With AOF enabled, a small
+  durable-commit gate additionally serializes the mutation and its log record.
+- `MSET` and `DEL` deduplicate shard IDs, lock them in ascending order, and
+  unlock in reverse order; duplicate-key behavior remains Redis-compatible.
+- Active expiry and eviction operate on shard-local indexes and subtotals.
+  Eviction is journalled as `DEL`; expiry is implied by its persisted deadline.
+- AOF rewrite starts tail capture before its shard walk, so concurrent writes
+  are represented by the snapshot, the tail, or harmlessly both.
 
-**Done when:** race and e2e coverage proves the old semantics, M5 shows a
-meaningful write-throughput gain, and the new complexity is documented in
-`DECISIONS.md`.
-
-**Current slice:** single-key reads are routed through 32 independently locked
-shard maps while the original map still coordinates mutation and housekeeping.
-On the M1 Pro, parallel GET improved from the prior 224 ns/op to 84 ns/op at
-eight CPUs (with a one-CPU cost of 55 ns/op to 68 ns/op). The next slice moves
-the canonical write path and multi-key lock ordering onto the shard maps.
+Checkpoint verification is green: unit tests, race tests, e2e tests, AOF
+replay/rewrite coverage, shard parity tests, and the refreshed store benchmark
+in `BENCHMARKS.md`. The final design rationale is in `DECISIONS.md`.
 
 ## 7. Production-facing features
 

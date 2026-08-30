@@ -108,9 +108,10 @@ func TestMemoryEstimateTracksRealHeapGrowth(t *testing.T) {
 // resolution, which is the right trade for the hot path and useless for a test
 // that wants to know exactly which key is oldest.
 func setAtime(s *Store, key string, at uint64) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	s.data[key].atime.Store(at)
+	shard := s.readShard(key)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	shard.data[key].atime.Store(at)
 }
 
 func TestNoEvictionRefusesInsteadOfDropping(t *testing.T) {

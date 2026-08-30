@@ -477,20 +477,21 @@ record makes that state unrepresentable. (This is also why `SET`'s `PXAT`/`EXAT`
 options exist as real commands here — the log's own vocabulary should be
 something a client could have typed.)
 
-### The journal append happens under the keyspace lock
+### The journal append happens under the durable-commit gate
 
-**Chosen:** `Store.propagate` is called while holding the write lock; the
-append encodes into a buffer and nothing else. The `write(2)` and the `fsync`
-happen later, from a caller that holds no keyspace lock.
+**Chosen:** `Store.propagate` is called while holding the durable-commit gate;
+the append encodes into a buffer and nothing else. The `write(2)` and the
+fsync happen later, after that gate is released.
 
-**Rejected:** appending after releasing the lock (the obvious way, and much
+**Rejected:** appending after releasing the gate (the obvious way, and much
 easier to keep the store ignorant of command names).
 
 **Why:** the log's order has to *be* the order mutations happened in. Two
-clients race to `SET k`; the keyspace lock picks a winner; if the appends
-happen after the lock is released, the loser can reach the file last, and
-replay rebuilds a keyspace that never existed — with the wrong value, silently,
-only under load, only after a restart.
+clients race to `SET k`; the key's shard lock picks a winner, and the durable
+gate commits its record in the same order. If the append happens after the gate
+is released, the loser can reach the file last, and replay rebuilds a keyspace
+that never existed — with the wrong value, silently, only under load, only
+after a restart.
 
 `TestJournalOrderMatchesMutationOrder` asserts the property directly: after 800
 racing writes to one key, the last record in the log must name the value the
@@ -499,10 +500,10 @@ lock makes it fail (on attempt 18 of 50, which is also a fair warning about how
 hard this class of bug is to catch by luck).
 
 The other half of the decision matters as much: **the fsync must not happen
-under that lock.** An fsync can take tens of milliseconds; holding the entire
-keyspace for that long would make every client on the server wait for one
-client's disk. So `Append` is a memcpy and `Sync` is a separate call the server
-makes after the lock is released.
+under that gate.** An fsync can take tens of milliseconds; holding it for that
+long would make every writer wait for one client's disk. So `Append` is a
+memcpy and `Sync` is a separate call the server makes after the gate is
+released.
 
 ### fsync policy: measured, not asserted
 
@@ -733,15 +734,29 @@ parsing below 2%; lock contention and network/syscall scheduling dominated.
 Changing ownership rules or adding pools for that amount of CPU would make the
 code harder to reason about while failing to move the measured bottleneck.
 
-### Stage-six checkpoint: shard reads before migrating writes
+### Stage-six final: canonical shard ownership
 
-**Chosen:** route single-key reads through 32 independently locked shard maps
-as the first sharding slice; keep the original map as the mutation,
-expiration, eviction, and AOF coordination point temporarily.
+**Chosen:** 32 FNV-1a-routed shards are the only keyspace state. A single-key
+command locks its shard; `MSET` and `DEL` deduplicate shard IDs, lock in
+ascending order, and unlock in reverse. A separate commit mutex serializes a
+durable mutation and its AOF append when AOF is enabled.
 
-**Why:** this establishes stable routing and validates the lock layout without
-splitting canonical mutation state. On the M1 Pro, parallel GET improved from
-224 ns/op to 84 ns/op at eight CPUs, while one-core GET rose from 55 ns/op to
-68 ns/op. The trade is deliberate: this checkpoint is safe and measurable,
-but it is not the final write-path architecture. Canonical shard ownership and
-deterministic multi-shard mutation are the next indivisible migration.
+**Rejected:** retaining mirrored global maps as a permanent coordination layer,
+or appending after releasing a shard lock.
+
+**Why:** mirrored maps turned every write into two writes and left the global
+mutex on the hot path, defeating the purpose of sharding. Ordered shard locks
+preserve whole-command `DEL`/`MSET` behavior without deadlock. The commit gate
+keeps replay order equal to mutation order while letting no-AOF workloads run
+unrelated shard writes concurrently. Appending outside that gate can replay a
+losing same-key write last and rebuild a state the server never held.
+
+**Expiry, eviction, and rewrite:** each shard owns its expiry index and memory
+subtotal; the samplers walk those local structures. Evictions are logged as
+`DEL`, while expiry is already represented by absolute deadlines. AOF rewrite
+starts tail capture before its shard snapshot, so a racing mutation appears in
+the snapshot, the tail, or both; duplicates are idempotent.
+
+**Measured result:** on the M1 Pro store microbenchmark, SET improved from
+181.7 ns/op at one CPU to 140.7 ns/op at eight CPUs. See `BENCHMARKS.md`; this
+is a store result, not a wire-server throughput claim.

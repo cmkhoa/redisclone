@@ -95,9 +95,6 @@ func (s *Store) activeExpireCycle() (scanned, expired int) {
 func (s *Store) expireSample(n int) (scanned, expired int) {
 	now := time.Now()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	// This cycle is the metronome for the coarse LRU clock: it runs on a timer
 	// and is already paying for a time.Now, so the read path never has to.
 	s.tick()
@@ -110,26 +107,31 @@ func (s *Store) expireSample(n int) (scanned, expired int) {
 	//
 	// Deleting from a map while ranging over it is defined behaviour in Go:
 	// entries deleted before they are reached are simply not produced.
-	for key := range s.expiring {
+	for i := range s.readShards {
 		if scanned == n {
 			break
 		}
-		scanned++
-
-		e, ok := s.data[key]
-		if !ok {
-			// A key in the index but not the keyspace means the two maps have
-			// drifted apart — a bug, not a race, since both are written under
-			// this same lock. Repair it rather than leaving a phantom that
-			// would be sampled forever.
-			delete(s.expiring, key)
-			continue
+		shard := &s.readShards[i]
+		shard.mu.Lock()
+		for key := range shard.expiring {
+			if scanned == n {
+				break
+			}
+			scanned++
+			e, ok := shard.data[key]
+			if !ok {
+				delete(shard.expiring, key)
+				continue
+			}
+			if e.expired(now) {
+				shard.used -= entrySize(key, e.val)
+				delete(shard.data, key)
+				delete(shard.expiring, key)
+				s.stats.ExpiredKeys.Add(1)
+				expired++
+			}
 		}
-		if e.expired(now) {
-			s.deleteLocked(key)
-			s.stats.ExpiredKeys.Add(1)
-			expired++
-		}
+		shard.mu.Unlock()
 	}
 	return scanned, expired
 }

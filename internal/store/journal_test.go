@@ -147,11 +147,11 @@ func TestExpiryCollectionIsNotJournalled(t *testing.T) {
 // The ordering property the whole design rests on: the journal's order is the
 // order mutations actually happened in.
 //
-// Many goroutines race to SET the same key. The store's lock picks a winner —
-// and because the journal append happens under that same lock, the *last*
-// record for the key must name the value the store ended up holding. Appending
-// after releasing the lock would let the loser's record land last, and replay
-// would rebuild a keyspace that never existed.
+// Many goroutines race to SET the same key. Its shard lock picks a winner,
+// then the durable-commit gate orders its journal append — so the *last* record
+// for the key must name the value the store ended up holding. Appending after
+// releasing that gate would let the loser's record land last, and replay would
+// rebuild a keyspace that never existed.
 func TestJournalOrderMatchesMutationOrder(t *testing.T) {
 	for attempt := 0; attempt < 50; attempt++ {
 		s, r := journalled(t)

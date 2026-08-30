@@ -81,12 +81,13 @@ const (
 
 // Journal records mutations durably so they can be replayed after a restart.
 //
-// The store calls Append while holding the keyspace write lock. That is not an
+// The store calls Append while holding its durable-commit gate. That is not an
 // accident and not negotiable: it is what guarantees the journal's order is the
-// order the mutations actually happened in. Two clients racing to SET the same
-// key are ordered by this lock; if the journal were appended after the lock was
-// released, the loser could reach the file second-to-last and replay would
-// rebuild a keyspace that never existed.
+// order mutations actually happened in. Two clients racing to SET the same key
+// are ordered by the key's write lock and then commit in that order; if the
+// journal were appended after the commit gate was released, the loser could
+// reach the file second-to-last and replay would rebuild a keyspace that never
+// existed.
 //
 // The consequence for implementers: Append must be cheap and must not block on
 // I/O. aof.Log satisfies that by encoding into a buffer and leaving the write
@@ -101,43 +102,24 @@ type Journal interface {
 // because the server runs one goroutine per connection and therefore runs
 // commands from different clients at the same time.
 type Store struct {
-	// One RWMutex over the whole store. Reads (GET, EXISTS, TTL) share it;
-	// writes (SET, DEL, EXPIRE, and the expiry sampler) take it exclusively.
-	// See DECISIONS.md for why this rather than a sharded map or sync.Map —
-	// briefly: this is the version whose correctness is obvious, and M5 is
-	// where measurements get to argue for something cleverer.
-	mu sync.RWMutex
+	// commitMu serializes the durable linearization point: a mutation that is
+	// visible in memory and its AOF record are committed in the same order.
+	// It is taken only while a journal is attached; otherwise unrelated shards
+	// mutate concurrently.
+	commitMu sync.Mutex
 
-	data map[string]*entry
-
-	// readShards are becoming the canonical keyspace. Each owns the data,
-	// volatile-key index, and memory subtotal for its key range. The legacy
-	// maps below remain only while write, expiry, and eviction paths migrate.
+	// readShards are the canonical keyspace. Each owns the data, volatile-key
+	// index, and memory subtotal for its key range.
 	readShards [shardCount]readShard
-
-	// expiring indexes the volatile keys — exactly the keys whose entry has a
-	// non-zero expiresAt.
-	//
-	// It exists for the sampler, which has to find expired keys without
-	// scanning the keyspace. Sampling `data` directly would work when most
-	// keys are volatile and degenerate to uselessness when few are: with a
-	// million persistent keys and ten volatile ones, twenty random samples
-	// almost never touch a key that can expire. Redis keeps a second dict for
-	// the same reason.
-	//
-	// The cost is that every write path has to keep two maps consistent;
-	// TestExpiringIndexStaysConsistent is what stops that being a slow leak.
-	expiring map[string]struct{}
 
 	// journal is nil when durability is off — and during replay, which is what
 	// stops a restart from rewriting everything it has just read.
 	journal Journal
 
 	// M4's accounting and eviction state. maxMemory and policy are configured
-	// before clients are accepted; used is always protected by mu.
+	// before clients are accepted.
 	maxMemory int64
 	policy    EvictionPolicy
-	used      int64
 	clock     atomic.Uint64
 	stats     Stats
 }
@@ -158,10 +140,7 @@ type Stats struct {
 }
 
 func New() *Store {
-	s := &Store{
-		data:     make(map[string]*entry),
-		expiring: make(map[string]struct{}),
-	}
+	s := &Store{}
 	for i := range s.readShards {
 		s.readShards[i].data = make(map[string]*entry)
 		s.readShards[i].expiring = make(map[string]struct{})
@@ -176,7 +155,21 @@ func (s *Store) readShard(key string) *readShard { return &s.readShards[shardInd
 // missing everything that came before it.
 func (s *Store) SetJournal(j Journal) { s.journal = j }
 
-// propagate records one mutation. Called with the write lock held.
+// lockDurableMutation takes the AOF linearization gate when durability is on.
+// Callers then take one shard lock, or a sorted set for a multi-key command.
+func (s *Store) lockDurableMutation() {
+	if s.journal != nil {
+		s.commitMu.Lock()
+	}
+}
+
+func (s *Store) unlockDurableMutation() {
+	if s.journal != nil {
+		s.commitMu.Unlock()
+	}
+}
+
+// propagate records one mutation. Called with lockDurableMutation held.
 //
 // The error is deliberately dropped: there is nothing useful the store can do
 // about a failed disk write, and the mutation has already happened in memory.
@@ -242,11 +235,11 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	// afresh, so the deadline is re-checked (against a *new* now) before
 	// anything is deleted. Skipping that re-check is how a lazy-expiry
 	// implementation ends up deleting live data under load.
-	s.mu.Lock()
-	if e, ok := s.data[key]; ok && e.expired(time.Now()) {
-		s.deleteLocked(key)
+	shard.mu.Lock()
+	if e, ok := shard.data[key]; ok && e.expired(time.Now()) {
+		s.deleteLockedInWriteLockedShard(key)
 	}
-	s.mu.Unlock()
+	shard.mu.Unlock()
 	return nil, false
 }
 
@@ -287,25 +280,28 @@ func (s *Store) SetWithDeadline(key string, val []byte, at time.Time) {
 }
 
 func (s *Store) set(key string, val []byte, expiresAt time.Time) {
-	s.mu.Lock()
+	s.lockDurableMutation()
 	s.setLocked(key, val, expiresAt)
-	s.mu.Unlock()
+	s.unlockDurableMutation()
 }
 
-// setLocked replaces key while preserving the accounting/index invariants.
-// The caller holds s.mu.
+// setLocked replaces key while preserving the owning shard's accounting/index
+// invariants.
 func (s *Store) setLocked(key string, val []byte, expiresAt time.Time) {
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	s.setLockedInWriteLockedShard(key, val, expiresAt)
+	shard.mu.Unlock()
+	s.propagateSetLocked(key, val, expiresAt)
+}
+
+func (s *Store) setLockedInWriteLockedShard(key string, val []byte, expiresAt time.Time) {
 	if val == nil {
 		val = []byte{}
 	}
-	if old, ok := s.data[key]; ok {
-		s.used -= entrySize(key, old.val)
-	}
 	e := &entry{val: val, expiresAt: expiresAt}
 	e.atime.Store(s.clock.Load())
-	s.data[key] = e
 	shard := s.readShard(key)
-	shard.mu.Lock()
 	if old, ok := shard.data[key]; ok {
 		shard.used -= entrySize(key, old.val)
 	}
@@ -316,17 +312,10 @@ func (s *Store) setLocked(key string, val []byte, expiresAt time.Time) {
 	} else {
 		shard.expiring[key] = struct{}{}
 	}
-	shard.mu.Unlock()
-	s.used += entrySize(key, val)
-	if expiresAt.IsZero() {
-		delete(s.expiring, key)
-	} else {
-		s.expiring[key] = struct{}{}
-	}
-	s.propagateSetLocked(key, val, expiresAt)
 }
 
-// propagateSetLocked records a full value replacement. The caller holds s.mu.
+// propagateSetLocked records a full value replacement. The caller holds the
+// durable-commit gate when a journal is attached.
 func (s *Store) propagateSetLocked(key string, val []byte, expiresAt time.Time) {
 	if expiresAt.IsZero() {
 		s.propagate(cmdSET, []byte(key), val)
@@ -346,46 +335,22 @@ type Pair struct {
 // MSet atomically applies all assignments. A later duplicate key wins, like
 // Redis. Plain assignments clear any previous TTL.
 func (s *Store) MSet(pairs []Pair) {
-	s.mu.Lock()
+	s.lockDurableMutation()
+	keys := make([]string, len(pairs))
+	for i, p := range pairs {
+		keys[i] = p.Key
+	}
+	ids := s.lockWriteShards(keys)
+	defer s.unlockWriteShards(ids)
+	defer s.unlockDurableMutation()
+
 	args := make([][]byte, 1, 1+2*len(pairs))
 	args[0] = cmdMSET
 	for _, p := range pairs {
-		s.setLockedNoJournal(p.Key, p.Value, time.Time{})
+		s.setLockedInWriteLockedShard(p.Key, p.Value, time.Time{})
 		args = append(args, []byte(p.Key), p.Value)
 	}
 	s.propagate(args...)
-	s.mu.Unlock()
-}
-
-func (s *Store) setLockedNoJournal(key string, val []byte, expiresAt time.Time) {
-	if val == nil {
-		val = []byte{}
-	}
-	if old, ok := s.data[key]; ok {
-		s.used -= entrySize(key, old.val)
-	}
-	e := &entry{val: val, expiresAt: expiresAt}
-	e.atime.Store(s.clock.Load())
-	s.data[key] = e
-	shard := s.readShard(key)
-	shard.mu.Lock()
-	if old, ok := shard.data[key]; ok {
-		shard.used -= entrySize(key, old.val)
-	}
-	shard.data[key] = e
-	shard.used += entrySize(key, val)
-	if expiresAt.IsZero() {
-		delete(shard.expiring, key)
-	} else {
-		shard.expiring[key] = struct{}{}
-	}
-	shard.mu.Unlock()
-	s.used += entrySize(key, val)
-	if expiresAt.IsZero() {
-		delete(s.expiring, key)
-	} else {
-		s.expiring[key] = struct{}{}
-	}
 }
 
 var ErrNotInteger = errors.New("value is not an integer or out of range")
@@ -394,8 +359,11 @@ var ErrNotInteger = errors.New("value is not an integer or out of range")
 // preserves a live key's TTL.
 func (s *Store) Increment(key string, delta int64) (int64, error) {
 	now := time.Now()
-	s.mu.Lock()
-	e, ok := s.data[key]
+	s.lockDurableMutation()
+	shard := s.readShard(key)
+	shard.mu.RLock()
+	e, ok := shard.data[key]
+	shard.mu.RUnlock()
 	if ok && e.expired(now) {
 		s.deleteLocked(key)
 		ok = false
@@ -405,12 +373,12 @@ func (s *Store) Increment(key string, delta int64) (int64, error) {
 		var err error
 		n, err = strconv.ParseInt(string(e.val), 10, 64)
 		if err != nil {
-			s.mu.Unlock()
+			s.unlockDurableMutation()
 			return 0, ErrNotInteger
 		}
 	}
 	if (delta > 0 && n > int64(^uint64(0)>>1)-delta) || (delta < 0 && n < -int64(^uint64(0)>>1)-1-delta) {
-		s.mu.Unlock()
+		s.unlockDurableMutation()
 		return 0, ErrNotInteger
 	}
 	n += delta
@@ -420,7 +388,7 @@ func (s *Store) Increment(key string, delta int64) (int64, error) {
 	}
 	val := strconv.AppendInt(nil, n, 10)
 	s.setLocked(key, val, expiresAt)
-	s.mu.Unlock()
+	s.unlockDurableMutation()
 	return n, nil
 }
 
@@ -428,8 +396,11 @@ func (s *Store) Increment(key string, delta int64) (int64, error) {
 // the existing value, because GET may have handed that slice to another client.
 func (s *Store) Append(key string, suffix []byte) int {
 	now := time.Now()
-	s.mu.Lock()
-	e, ok := s.data[key]
+	s.lockDurableMutation()
+	shard := s.readShard(key)
+	shard.mu.RLock()
+	e, ok := shard.data[key]
+	shard.mu.RUnlock()
 	if ok && e.expired(now) {
 		s.deleteLocked(key)
 		ok = false
@@ -443,7 +414,7 @@ func (s *Store) Append(key string, suffix []byte) int {
 	copy(val, old)
 	copy(val[len(old):], suffix)
 	s.setLocked(key, val, expiresAt)
-	s.mu.Unlock()
+	s.unlockDurableMutation()
 	return len(val)
 }
 
@@ -467,30 +438,29 @@ func (s *Store) Expire(key string, ttl time.Duration) bool {
 func (s *Store) ExpireAt(key string, at time.Time) bool {
 	now := time.Now()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.lockDurableMutation()
+	defer s.unlockDurableMutation()
 
-	e, ok := s.data[key]
+	shard := s.readShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	e, ok := shard.data[key]
 	if !ok || e.expired(now) {
 		// Already gone as far as any client is concerned. Collect it while we
 		// are here, holding the write lock anyway.
 		if ok {
-			s.deleteLocked(key)
+			s.deleteLockedInWriteLockedShard(key)
 			s.propagate(cmdDEL, []byte(key))
 		}
 		return false
 	}
 	if !at.After(now) {
-		s.deleteLocked(key)
+		s.deleteLockedInWriteLockedShard(key)
 		s.propagate(cmdDEL, []byte(key))
 		return true
 	}
-	shard := s.readShard(key)
-	shard.mu.Lock()
 	e.expiresAt = at
 	shard.expiring[key] = struct{}{}
-	shard.mu.Unlock()
-	s.expiring[key] = struct{}{}
 	s.propagate(cmdPEXPIREAT, []byte(key), unixMillis(at))
 	return true
 }
@@ -533,7 +503,10 @@ func (s *Store) Del(keys ...string) int {
 	now := time.Now()
 	n := 0
 
-	s.mu.Lock()
+	s.lockDurableMutation()
+	ids := s.lockWriteShards(keys)
+	defer s.unlockWriteShards(ids)
+	defer s.unlockDurableMutation()
 	// The journal records what was removed, not what was asked for: a DEL of
 	// three keys where only one existed replays as a one-key DEL. Keeping the
 	// log to actual effects is what makes replay independent of the state the
@@ -541,11 +514,12 @@ func (s *Store) Del(keys ...string) int {
 	removed := make([][]byte, 0, len(keys)+1)
 	removed = append(removed, cmdDEL)
 	for _, k := range keys {
-		e, ok := s.data[k]
+		shard := s.readShard(k)
+		e, ok := shard.data[k]
 		if !ok {
 			continue
 		}
-		s.deleteLocked(k)
+		s.deleteLockedInWriteLockedShard(k)
 		removed = append(removed, []byte(k))
 		if !e.expired(now) {
 			n++
@@ -554,7 +528,6 @@ func (s *Store) Del(keys ...string) int {
 	if len(removed) > 1 {
 		s.propagate(removed...)
 	}
-	s.mu.Unlock()
 	return n
 }
 
@@ -650,22 +623,22 @@ func (s *Store) tick() { s.clock.Add(1) }
 // TestLazyExpiryDoesNotDeleteAResurrectedKey.
 var testHookExpiredWindow func()
 
-// deleteLocked removes a key from both maps. The caller holds the write lock.
-//
-// Every deletion in this package goes through here — that is the whole defence
-// against the two maps drifting apart.
+// deleteLocked removes a key from its owning shard.
 func (s *Store) deleteLocked(key string) {
-	if e, ok := s.data[key]; ok {
-		s.used -= entrySize(key, e.val)
-	}
-	delete(s.data, key)
 	shard := s.readShard(key)
 	shard.mu.Lock()
+	s.deleteLockedInWriteLockedShard(key)
+	shard.mu.Unlock()
+}
+
+// deleteLockedInWriteLockedShard removes key from its owning shard. The caller
+// holds the shard's write lock; Del uses it after
+// acquiring all of its shards in sorted order.
+func (s *Store) deleteLockedInWriteLockedShard(key string) {
+	shard := s.readShard(key)
 	if e, ok := shard.data[key]; ok {
 		shard.used -= entrySize(key, e.val)
 	}
 	delete(shard.data, key)
 	delete(shard.expiring, key)
-	shard.mu.Unlock()
-	delete(s.expiring, key)
 }
