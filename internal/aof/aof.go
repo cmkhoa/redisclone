@@ -15,9 +15,11 @@ package aof
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -70,6 +72,13 @@ type Log struct {
 	bw     *bufio.Writer
 	w      *resp.Writer
 	policy Policy
+	path   string
+
+	// rewriting mirrors every append into rewriteTail while a background
+	// rewrite builds its snapshot. FinishRewrite appends this tail before the
+	// atomic rename, so no mutation that raced with the snapshot is lost.
+	rewriting   bool
+	rewriteTail bytes.Buffer
 
 	// err latches the first write or fsync failure. Once the log is broken,
 	// every subsequent write command is refused rather than being accepted
@@ -87,7 +96,7 @@ func Open(path string, policy Policy) (*Log, error) {
 		return nil, fmt.Errorf("open aof: %w", err)
 	}
 	bw := bufio.NewWriterSize(f, 64*1024)
-	return &Log{f: f, bw: bw, w: resp.NewWriter(bw), policy: policy}, nil
+	return &Log{f: f, bw: bw, w: resp.NewWriter(bw), policy: policy, path: path}, nil
 }
 
 // Policy returns the log's fsync policy.
@@ -105,15 +114,128 @@ func (l *Log) Append(args ...[]byte) error {
 	if l.err != nil {
 		return l.err
 	}
-	if err := l.w.WriteArrayHeader(len(args)); err != nil {
+	if err := writeCommand(l.w, args); err != nil {
 		return l.fail(err)
 	}
-	for _, a := range args {
-		if err := l.w.WriteBulkString(a); err != nil {
+	if l.rewriting {
+		if err := writeCommand(resp.NewWriter(&l.rewriteTail), args); err != nil {
 			return l.fail(err)
 		}
 	}
 	return nil
+}
+
+func writeCommand(w *resp.Writer, args [][]byte) error {
+	if err := w.WriteArrayHeader(len(args)); err != nil {
+		return err
+	}
+	for _, a := range args {
+		if err := w.WriteBulkString(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BeginRewrite starts retaining every new mutation for a replacement AOF.
+// Call Snapshot only after this succeeds; that ordering is what makes writes
+// concurrent with the snapshot appear in the final file.
+func (l *Log) BeginRewrite() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	if l.rewriting {
+		return fmt.Errorf("AOF rewrite already in progress")
+	}
+	l.rewriting = true
+	l.rewriteTail.Reset()
+	return nil
+}
+
+// FinishRewrite atomically replaces the AOF with snapshot followed by all
+// mutations appended since BeginRewrite. snapshot is a stream of command args.
+func (l *Log) FinishRewrite(snapshot [][][]byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(l.path), ".redisclone-rewrite-*")
+	if err != nil {
+		l.abortRewrite()
+		return fmt.Errorf("create rewrite AOF: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	bw := bufio.NewWriterSize(tmp, 64*1024)
+	w := resp.NewWriter(bw)
+	for _, args := range snapshot {
+		if err := writeCommand(w, args); err != nil {
+			tmp.Close()
+			l.abortRewrite()
+			return fmt.Errorf("write rewrite snapshot: %w", err)
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		tmp.Close()
+		l.abortRewrite()
+		return fmt.Errorf("flush rewrite snapshot: %w", err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.rewriting {
+		tmp.Close()
+		return fmt.Errorf("AOF rewrite is not in progress")
+	}
+	if l.err != nil {
+		tmp.Close()
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return l.err
+	}
+	if _, err := tmp.Write(l.rewriteTail.Bytes()); err != nil {
+		tmp.Close()
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return fmt.Errorf("write rewrite tail: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return fmt.Errorf("sync rewrite AOF: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return fmt.Errorf("close rewrite AOF: %w", err)
+	}
+	if err := os.Rename(tmpName, l.path); err != nil {
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return fmt.Errorf("install rewrite AOF: %w", err)
+	}
+
+	newFile, err := os.OpenFile(l.path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		l.rewriting = false
+		l.rewriteTail.Reset()
+		return l.fail(fmt.Errorf("reopen rewritten AOF: %w", err))
+	}
+	oldFile := l.f
+	l.f = newFile
+	l.bw = bufio.NewWriterSize(newFile, 64*1024)
+	l.w = resp.NewWriter(l.bw)
+	l.rewriting = false
+	l.rewriteTail.Reset()
+	_ = oldFile.Close() // the replacement is synced and installed already.
+	return nil
+}
+
+func (l *Log) abortRewrite() {
+	l.mu.Lock()
+	l.rewriting = false
+	l.rewriteTail.Reset()
+	l.mu.Unlock()
 }
 
 // Sync flushes the buffer to the kernel and, unless the policy says otherwise,

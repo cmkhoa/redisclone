@@ -551,6 +551,27 @@ func (s *Store) DBSize() int {
 // Stats returns the server counters. Callers load the atomic fields they need.
 func (s *Store) Stats() *Stats { return &s.stats }
 
+// AOFSnapshot returns one absolute-deadline SET command per live key. Values
+// are immutable once stored, so they can safely be used after the read lock is
+// released while the AOF writer works in the background.
+func (s *Store) AOFSnapshot() [][][]byte {
+	now := time.Now()
+	s.mu.RLock()
+	out := make([][][]byte, 0, len(s.data))
+	for key, e := range s.data {
+		if e.expired(now) {
+			continue
+		}
+		record := [][]byte{cmdSET, []byte(key), e.val}
+		if !e.expiresAt.IsZero() {
+			record = append(record, cmdPXAT, unixMillis(e.expiresAt))
+		}
+		out = append(out, record)
+	}
+	s.mu.RUnlock()
+	return out
+}
+
 // tick advances the coarse LRU clock. The expiry ticker calls it every 100ms,
 // avoiding a clock read/write on every GET while retaining useful recency.
 func (s *Store) tick() { s.clock.Add(1) }

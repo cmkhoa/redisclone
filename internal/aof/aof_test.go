@@ -329,3 +329,35 @@ func TestWriteErrorsAreLatched(t *testing.T) {
 		t.Error("Append succeeded after the log had already failed")
 	}
 }
+
+func TestRewriteAppendsConcurrentTail(t *testing.T) {
+	l, path := tempLog(t, PolicyEverysec)
+	if err := l.BeginRewrite(); err != nil {
+		t.Fatal(err)
+	}
+	// This write races with snapshot construction in the real server. It must
+	// appear after the snapshot record in the replacement log.
+	if err := l.Append(bulks("SET", "k", "new")...); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.FinishRewrite([][][]byte{bulks("SET", "k", "old")}); err != nil {
+		t.Fatal(err)
+	}
+
+	var records []string
+	if _, err := Replay(path, func(args [][]byte) error {
+		records = append(records, strings.Join(func() []string {
+			out := make([]string, len(args))
+			for i, a := range args {
+				out[i] = string(a)
+			}
+			return out
+		}(), " "))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(records, ","), "SET k old,SET k new"; got != want {
+		t.Errorf("rewritten records = %q, want %q", got, want)
+	}
+}

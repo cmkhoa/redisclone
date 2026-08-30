@@ -31,7 +31,7 @@ returned by `GET`, so stored bytes must never be modified in place.
 **Done when:** unit and black-box tests cover normal, binary-safe, wrong-type,
 overflow, duplicate-key, and concurrent cases.
 
-## 3. Improve operational control
+## 3. Improve operational control — complete
 
 **Scope:** observability and safe runtime configuration.
 
@@ -44,7 +44,7 @@ overflow, duplicate-key, and concurrent cases.
 state through Redis commands, and a normal termination does not lose buffered
 AOF data.
 
-## 4. Compact the AOF
+## 4. Compact the AOF — complete
 
 **Scope:** durability internals; preserve existing client semantics.
 
@@ -58,7 +58,7 @@ AOF data.
 **Done when:** e2e tests prove that a rewrite shrinks a churned log, survives
 restart, preserves TTLs, and remains correct while clients write concurrently.
 
-## 5. Reduce easy hot-path overhead
+## 5. Reduce easy hot-path overhead — complete
 
 **Scope:** performance work that does not alter locking semantics.
 
@@ -71,6 +71,11 @@ restart, preserves TTLs, and remains correct while clients write concurrently.
 
 **Done when:** every accepted optimization has before/after numbers recorded
 in `DECISIONS.md`.
+
+**Result:** a ten-second sustained SET profile found allocation at roughly 2.4%
+of cumulative CPU and RESP bulk parsing below 2%. The dominant costs remained
+the keyspace lock and network/syscall scheduling, so no parser or allocation
+rewrite was accepted. Stage 6 is the evidence-backed performance next step.
 
 ## 6. Shard the keyspace
 

@@ -11,9 +11,11 @@ defensible design choices.
 - String operations: `INCR`, `DECR`, `APPEND`, `STRLEN`
 - Key expiry: `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`
 - Append-only-file durability with `always`, `everysec`, and `no` fsync modes
+- `BGREWRITEAOF` compacts the append-only file without stopping writes
 - Memory limits with `noeviction`, `allkeys-lru`, `allkeys-random`, and
   `volatile-lru` policies
 - `INFO` and `DBSIZE`
+- `CONFIG GET` for supported startup settings; graceful SIGINT/SIGTERM shutdown
 
 ## Run
 

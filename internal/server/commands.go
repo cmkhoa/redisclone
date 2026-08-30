@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"math"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -40,26 +41,28 @@ type command struct {
 // exist" and "what is its arity" answerable without running the handler, which
 // COMMAND DOCS and, later, MULTI's queue-time validation both need.
 var commands = map[string]command{
-	"PING":      {0, 1, false, (*Server).ping},
-	"ECHO":      {1, 1, false, (*Server).echo},
-	"SET":       {2, 4, true, (*Server).set},
-	"MSET":      {2, -1, true, (*Server).mset},
-	"GET":       {1, 1, false, (*Server).get},
-	"MGET":      {1, -1, false, (*Server).mget},
-	"INCR":      {1, 1, true, (*Server).incr},
-	"DECR":      {1, 1, true, (*Server).decr},
-	"APPEND":    {2, 2, true, (*Server).append},
-	"STRLEN":    {1, 1, false, (*Server).strlen},
-	"DEL":       {1, -1, true, (*Server).del},
-	"EXISTS":    {1, -1, false, (*Server).exists},
-	"EXPIRE":    {2, 2, true, (*Server).expire},
-	"PEXPIRE":   {2, 2, true, (*Server).pexpire},
-	"EXPIREAT":  {2, 2, true, (*Server).expireat},
-	"PEXPIREAT": {2, 2, true, (*Server).pexpireat},
-	"TTL":       {1, 1, false, (*Server).ttl},
-	"PTTL":      {1, 1, false, (*Server).pttl},
-	"DBSIZE":    {0, 0, false, (*Server).dbsize},
-	"INFO":      {0, 1, false, (*Server).info},
+	"PING":         {0, 1, false, (*Server).ping},
+	"ECHO":         {1, 1, false, (*Server).echo},
+	"SET":          {2, 4, true, (*Server).set},
+	"MSET":         {2, -1, true, (*Server).mset},
+	"GET":          {1, 1, false, (*Server).get},
+	"MGET":         {1, -1, false, (*Server).mget},
+	"INCR":         {1, 1, true, (*Server).incr},
+	"DECR":         {1, 1, true, (*Server).decr},
+	"APPEND":       {2, 2, true, (*Server).append},
+	"STRLEN":       {1, 1, false, (*Server).strlen},
+	"DEL":          {1, -1, true, (*Server).del},
+	"EXISTS":       {1, -1, false, (*Server).exists},
+	"EXPIRE":       {2, 2, true, (*Server).expire},
+	"PEXPIRE":      {2, 2, true, (*Server).pexpire},
+	"EXPIREAT":     {2, 2, true, (*Server).expireat},
+	"PEXPIREAT":    {2, 2, true, (*Server).pexpireat},
+	"TTL":          {1, 1, false, (*Server).ttl},
+	"PTTL":         {1, 1, false, (*Server).pttl},
+	"DBSIZE":       {0, 0, false, (*Server).dbsize},
+	"INFO":         {0, 1, false, (*Server).info},
+	"CONFIG":       {2, -1, false, (*Server).configGet},
+	"BGREWRITEAOF": {0, 0, false, (*Server).bgrewriteaof},
 }
 
 // dispatch runs one command and writes its reply. The returned error is an I/O
@@ -68,6 +71,7 @@ var commands = map[string]command{
 //
 // Command names are case-insensitive on the wire.
 func (s *Server) dispatch(w *resp.Writer, args [][]byte) error {
+	s.commands.Add(1)
 	name := strings.ToUpper(string(args[0]))
 	cmd, ok := commands[name]
 	if !ok {
@@ -293,6 +297,8 @@ func (s *Server) info(w *resp.Writer, args [][]byte) error {
 		s.store.Used(), s.store.MaxMemory(), s.store.Policy()))
 	write("stats", fmt.Sprintf("# Stats\r\nkeyspace_hits:%d\r\nkeyspace_misses:%d\r\nevicted_keys:%d\r\nexpired_keys:%d\r\n",
 		st.KeyspaceHits.Load(), st.KeyspaceMisses.Load(), st.EvictedKeys.Load(), st.ExpiredKeys.Load()))
+	write("clients", fmt.Sprintf("# Clients\r\nconnected_clients:%d\r\n", s.ConnectedClients()))
+	write("stats", fmt.Sprintf("total_commands_processed:%d\r\n", s.CommandCalls()))
 	aofEnabled := 0
 	if s.aof != nil {
 		aofEnabled = 1
@@ -300,6 +306,68 @@ func (s *Server) info(w *resp.Writer, args [][]byte) error {
 	write("persistence", fmt.Sprintf("# Persistence\r\naof_enabled:%d\r\n", aofEnabled))
 	write("keyspace", fmt.Sprintf("# Keyspace\r\ndb0:keys=%d\r\n", s.store.DBSize()))
 	return w.WriteBulkString([]byte(out.String()))
+}
+
+// configGet implements the read-only subset of CONFIG needed to inspect this
+// server's startup settings. Patterns follow the familiar Redis glob form.
+func (s *Server) configGet(w *resp.Writer, args [][]byte) error {
+	if !strings.EqualFold(string(args[0]), "GET") {
+		return w.WriteError("ERR unsupported CONFIG subcommand")
+	}
+	if len(args) != 2 {
+		return wrongArity(w, "CONFIG")
+	}
+	settings := []struct{ name, value string }{
+		{"maxmemory", strconv.FormatInt(s.store.MaxMemory(), 10)},
+		{"maxmemory-policy", string(s.store.Policy())},
+		{"appendonly", map[bool]string{true: "yes", false: "no"}[s.config.AppendOnly]},
+		{"appendfsync", s.config.AppendFsync},
+		{"appendfilename", s.config.AppendFilename},
+		{"dir", s.config.Dir},
+	}
+	pattern := string(args[1])
+	matched := make([]struct{ name, value string }, 0, len(settings))
+	for _, setting := range settings {
+		ok, err := path.Match(pattern, setting.name)
+		if err != nil {
+			return w.WriteError("ERR invalid CONFIG pattern")
+		}
+		if ok {
+			matched = append(matched, setting)
+		}
+	}
+	if err := w.WriteArrayHeader(len(matched) * 2); err != nil {
+		return err
+	}
+	for _, setting := range matched {
+		if err := w.WriteBulkString([]byte(setting.name)); err != nil {
+			return err
+		}
+		if err := w.WriteBulkString([]byte(setting.value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) bgrewriteaof(w *resp.Writer, _ [][]byte) error {
+	if s.aof == nil {
+		return w.WriteError("ERR BGREWRITEAOF called without appendonly enabled")
+	}
+	if err := s.aof.BeginRewrite(); err != nil {
+		return w.WriteError("ERR " + err.Error())
+	}
+	s.rewriteWG.Add(1)
+	go func() {
+		defer s.rewriteWG.Done()
+		snapshot := s.store.AOFSnapshot()
+		if err := s.aof.FinishRewrite(snapshot); err != nil {
+			s.logger.Printf("AOF rewrite: %v", err)
+			return
+		}
+		s.logger.Printf("AOF rewrite complete: %d live keys", len(snapshot))
+	}()
+	return w.WriteSimpleString("Background append only file rewriting started")
 }
 
 // keys converts command arguments to map keys.

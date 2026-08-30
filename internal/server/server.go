@@ -12,6 +12,9 @@ import (
 	"net"
 	"runtime/debug"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"redisclone/internal/aof"
 	"redisclone/internal/resp"
@@ -37,6 +40,21 @@ type Server struct {
 	// every use of it is guarded.
 	aof    *aof.Log
 	logger *log.Logger
+	config Config
+
+	connections atomic.Int64
+	commands    atomic.Uint64
+	conns       sync.Map // map[net.Conn]struct{}, owned by Serve
+	connWG      sync.WaitGroup
+	rewriteWG   sync.WaitGroup
+}
+
+// Config is the subset of startup configuration exposed through CONFIG GET.
+type Config struct {
+	AppendOnly     bool
+	AppendFsync    string
+	AppendFilename string
+	Dir            string
 }
 
 func New(logger *log.Logger) *Server {
@@ -48,6 +66,9 @@ func New(logger *log.Logger) *Server {
 
 // Store exposes the keyspace for tests.
 func (s *Server) Store() *store.Store { return s.store }
+
+// Configure records startup settings before clients are served.
+func (s *Server) Configure(c Config) { s.config = c }
 
 // AttachAOF makes the server durable: every mutation from now on is journalled,
 // and write commands are refused if the journal fails.
@@ -152,9 +173,38 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
-		go s.HandleConn(conn)
+		s.connections.Add(1)
+		s.conns.Store(conn, struct{}{})
+		s.connWG.Add(1)
+		go func() {
+			defer s.connWG.Done()
+			defer s.connections.Add(-1)
+			defer s.conns.Delete(conn)
+			s.HandleConn(conn)
+		}()
 	}
 }
+
+// Drain waits for current clients to finish. Once timeout elapses it closes
+// the remaining connections, then waits for their handlers to return.
+func (s *Server) Drain(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() { s.connWG.Wait(); close(done) }()
+	select {
+	case <-done:
+		return
+	case <-time.After(timeout):
+	}
+	s.conns.Range(func(key, _ any) bool { _ = key.(net.Conn).Close(); return true })
+	<-done
+}
+
+func (s *Server) ConnectedClients() int64 { return s.connections.Load() }
+func (s *Server) CommandCalls() uint64    { return s.commands.Load() }
+
+// WaitBackground waits for an in-progress AOF rewrite. Shutdown calls this
+// before closing the log, so a rewrite cannot race with the final flush.
+func (s *Server) WaitBackground() { s.rewriteWG.Wait() }
 
 // HandleConn runs one connection's read/dispatch/reply loop until the client
 // disconnects or sends unparseable bytes.
@@ -210,6 +260,8 @@ func (s *Server) reportReadError(conn net.Conn, w *resp.Writer, err error) {
 	switch {
 	case errors.Is(err, io.EOF):
 		// Clean disconnect at a command boundary. Not an error.
+	case errors.Is(err, net.ErrClosed):
+		// Drain closed an idle client during orderly shutdown.
 	case errors.As(err, &pe):
 		_ = w.WriteError("ERR " + pe.Error())
 	case errors.Is(err, io.ErrUnexpectedEOF):

@@ -50,6 +50,7 @@ func main() {
 	logger.Printf("redisclone listening on %s", l.Addr())
 
 	srv := server.New(logger)
+	srv.Configure(server.Config{AppendOnly: *appendOnly, AppendFsync: *appendFsync, AppendFilename: *appendFilename, Dir: *dir})
 	max, err := store.ParseMemory(*maxMemory)
 	if err != nil {
 		logger.Fatalf("-maxmemory: %v", err)
@@ -100,9 +101,9 @@ func main() {
 	defer cancel()
 	srv.StartBackgroundTasks(ctx)
 
-	// Closing the listener makes Serve's Accept fail with net.ErrClosed, which
-	// it treats as a clean shutdown. In-flight connections are not drained yet
-	// — there is no state to lose until M3's AOF.
+	// Closing the listener stops new clients. After Serve returns we give active
+	// clients a brief chance to finish, then close stragglers before the AOF is
+	// closed and flushed.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -115,6 +116,9 @@ func main() {
 	if err := srv.Serve(l); err != nil {
 		logger.Fatalf("serve: %v", err)
 	}
-	// Serve returned because the listener closed, i.e. we are shutting down.
-	// The deferred Close on the log flushes and fsyncs what is still buffered.
+	cancel()
+	// A quarter second lets a pipelined reply drain without making shutdown
+	// depend on idle clients that keep their sockets open indefinitely.
+	srv.Drain(250 * time.Millisecond)
+	srv.WaitBackground()
 }

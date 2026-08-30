@@ -103,6 +103,22 @@ func (d *durableServer) conn() net.Conn {
 
 func (d *durableServer) aofPath() string { return filepath.Join(d.dir, "appendonly.aof") }
 
+func TestBGRewriteAOFCompactsAndSurvivesRestart(t *testing.T) {
+	d := startDurable(t, "always")
+	c := d.conn()
+	for i := 0; i < 100; i++ {
+		sendRecvExact(t, c, cmd("SET", "churn", fmt.Sprintf("%d", i)), "+OK\r\n")
+	}
+	sendRecvExact(t, c, cmd("SET", "ttl", "v", "EX", "600"), "+OK\r\n")
+	sendRecvExact(t, c, cmd("BGREWRITEAOF"), "+Background append only file rewriting started\r\n")
+
+	// Graceful restart waits for the background rewrite before closing the AOF.
+	d.restart()
+	c2 := d.conn()
+	sendRecvExact(t, c2, cmd("GET", "churn"), bulk("99"))
+	sendRecvExact(t, c2, cmd("GET", "ttl"), bulk("v"))
+}
+
 // The headline: the keyspace survives a restart.
 func TestDataSurvivesARestart(t *testing.T) {
 	d := startDurable(t, "everysec")

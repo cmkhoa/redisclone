@@ -719,3 +719,16 @@ atomicity contract in the same breath. Multi-key DEL is currently atomic under
 one lock; a sharded map needs a deterministic multi-lock protocol and new
 tests to preserve that guarantee. M5's job was to produce evidence and an
 honest bottleneck, not to hide a semantic redesign behind a throughput number.
+
+### No speculative parser optimization
+
+**Chosen:** leave RESP parsing and allocation behavior unchanged after the
+stage-five sustained SET profile.
+
+**Rejected:** a zero-copy parser, command-name fast paths, or buffer-pool work
+without a measurable profile target.
+
+**Why:** the profile put allocation at about 2.4% cumulative CPU and bulk
+parsing below 2%; lock contention and network/syscall scheduling dominated.
+Changing ownership rules or adding pools for that amount of CPU would make the
+code harder to reason about while failing to move the measured bottleneck.

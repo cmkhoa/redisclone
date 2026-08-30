@@ -245,4 +245,27 @@ func TestExpireAtCommands(t *testing.T) {
 	}
 }
 
+func TestBGRewriteAOFCompactsAndReplays(t *testing.T) {
+	original, path := durable(t, aof.PolicyEverysec)
+	for i := 0; i < 50; i++ {
+		run(t, original, cmd("SET", "churn", strconv.Itoa(i)))
+	}
+	run(t, original, cmd("SET", "kept", "value", "EX", "600"))
+	if got := run(t, original, cmd("BGREWRITEAOF")); got != "+Background append only file rewriting started\r\n" {
+		t.Fatalf("BGREWRITEAOF = %q", got)
+	}
+	original.WaitBackground()
+	if err := original.aof.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := New(log.New(io.Discard, "", 0))
+	if _, err := restarted.ReplayAOF(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, restarted, cmd("GET", "churn")+cmd("GET", "kept")); got != "$2\r\n49\r\n$5\r\nvalue\r\n" {
+		t.Errorf("replay after rewrite = %q", got)
+	}
+}
+
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
