@@ -758,5 +758,6 @@ starts tail capture before its shard snapshot, so a racing mutation appears in
 the snapshot, the tail, or both; duplicates are idempotent.
 
 **Measured result:** on the M1 Pro store microbenchmark, SET improved from
-181.7 ns/op at one CPU to 140.7 ns/op at eight CPUs. See `BENCHMARKS.md`; this
-is a store result, not a wire-server throughput claim.
+184.7 ns/op at one CPU to 146.8 ns/op at eight CPUs. The matching wire
+benchmark reached 1,060,445 SET/s and 1,290,323 GET/s. See `BENCHMARKS.md` for
+the full command and latency figures.
